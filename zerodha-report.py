@@ -18,7 +18,7 @@ import html
 import webbrowser
 from pathlib import Path
 from datetime import date, datetime
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_DOWN
 from collections import defaultdict
 import xml.etree.ElementTree as ET
 
@@ -114,7 +114,7 @@ def which_quarter(d, quarters):
 def format_inr(value, truncate=False, decimals=0):
     negative = value < 0
     quantum = Decimal(1).scaleb(-decimals)
-    rounding = "ROUND_DOWN" if truncate else ROUND_HALF_UP
+    rounding = "ROUND_DOWN" if truncate else ROUND_HALF_DOWN
     scaled = value.copy_abs().quantize(quantum, rounding=rounding)
     whole, _, frac = str(scaled).partition(".")
     if len(whole) > 3:
@@ -784,6 +784,7 @@ def build_report_html(
         render_table(
             ["Field", "Value"],
             [[label, client_info.get(label, "")] for label in ("Client ID", "Client Name", "PAN")],
+            right_align_from=99,
             total_label=None,
         ),
         "<h2>Capital Gains Tax Rates (FY 2025-26 / AY 2026-27)</h2>",
