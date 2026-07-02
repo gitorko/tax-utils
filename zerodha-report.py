@@ -130,6 +130,16 @@ def format_inr(value, truncate=False, decimals=0):
     return ("-" if negative else "") + whole + suffix
 
 
+def find_client_info(rows):
+    info = {}
+    for _, row in rows:
+        label = row.get("B")
+        value = row.get("C")
+        if isinstance(label, str) and label.strip() in ("Client ID", "Client Name", "PAN"):
+            info[label.strip()] = value
+    return info
+
+
 # ---------------------------------------------------------------------------
 # Equity Dividends
 # ---------------------------------------------------------------------------
@@ -291,6 +301,79 @@ def split_by_holding_period(trades, threshold_days=365):
     short_term = [t for t in trades if (t["Exit"] - t["Entry"]).days <= threshold_days]
     long_term = [t for t in trades if (t["Exit"] - t["Entry"]).days > threshold_days]
     return short_term, long_term
+
+
+# ---------------------------------------------------------------------------
+# Mutual Funds - Debt
+# ---------------------------------------------------------------------------
+
+MF_TRADE_COLS = {
+    "Symbol": "B",
+    "Entry": "D",
+    "Exit": "E",
+    "Buy": "G",
+    "Sell": "H",
+}
+
+DEBT_FUND_RULE_CHANGE_DATE = date(2024, 7, 23)
+DEBT_FUND_GRANDFATHER_CUTOFF = date(2023, 4, 1)
+
+
+def extract_mf_trades(data_rows):
+    trades = []
+    for row in data_rows:
+        d = {k: row.get(col) for k, col in MF_TRADE_COLS.items()}
+        d["Entry"] = datetime.strptime(d["Entry"].strip(), "%Y-%m-%d").date()
+        d["Exit"] = datetime.strptime(d["Exit"].strip(), "%Y-%m-%d").date()
+        trades.append(d)
+    return trades
+
+
+def months_held(entry_date, exit_date):
+    months = (exit_date.year - entry_date.year) * 12 + (exit_date.month - entry_date.month)
+    if exit_date.day < entry_date.day:
+        months -= 1
+    return months
+
+
+def classify_debt_fund_trades(trades):
+    """India debt mutual fund tax treatment:
+    - Bought before 1-Apr-2023, sold before 23-Jul-2024: STCG (slab) if held <=36 months,
+      else LTCG at 20% with indexation.
+    - Bought before 1-Apr-2023, sold on/after 23-Jul-2024: STCG (slab) if held <=24 months,
+      else LTCG at 12.5% without indexation.
+    - Bought on/after 1-Apr-2023: always taxed at slab rate, regardless of holding period."""
+    buckets = {
+        "old_rule_stcg": [],
+        "old_rule_ltcg": [],
+        "new_rule_stcg": [],
+        "new_rule_ltcg": [],
+        "post_2023_purchase": [],
+    }
+    for t in trades:
+        if t["Entry"] >= DEBT_FUND_GRANDFATHER_CUTOFF:
+            buckets["post_2023_purchase"].append(t)
+        elif t["Exit"] < DEBT_FUND_RULE_CHANGE_DATE:
+            key = "old_rule_ltcg" if months_held(t["Entry"], t["Exit"]) > 36 else "old_rule_stcg"
+            buckets[key].append(t)
+        else:
+            key = "new_rule_ltcg" if months_held(t["Entry"], t["Exit"]) > 24 else "new_rule_stcg"
+            buckets[key].append(t)
+    return buckets
+
+
+def group_mf_transactions(trades):
+    """Mutual fund redemptions carry no STT/DP/brokerage charges."""
+    by_transaction = defaultdict(lambda: {"buy": Decimal(0), "sell": Decimal(0)})
+    for t in trades:
+        key = (t["Symbol"], t["Entry"], t["Exit"])
+        by_transaction[key]["buy"] += t["Buy"]
+        by_transaction[key]["sell"] += t["Sell"]
+
+    transactions = []
+    for (symbol, entry_date, exit_date), totals in sorted(by_transaction.items(), key=lambda kv: kv[0][2]):
+        transactions.append((symbol, entry_date, exit_date, totals["buy"], totals["sell"], Decimal(0)))
+    return transactions
 
 
 def group_transactions(trades):
@@ -554,6 +637,7 @@ HTML_STYLE = """
 body { font-family: -apple-system, Helvetica, Arial, sans-serif; margin: 2rem; color: #222; }
 h1 { font-size: 1.4rem; }
 h2 { font-size: 1.1rem; margin-top: 2.5rem; border-bottom: 1px solid #ccc; padding-bottom: 0.3rem; }
+h3 { font-size: 0.95rem; margin-top: 1.25rem; color: #444; }
 table { border-collapse: collapse; margin-top: 0.75rem; }
 th, td { border: 1px solid #ddd; padding: 4px 10px; font-size: 0.9rem; white-space: nowrap; }
 th { background: #f2f2f2; text-align: left; }
@@ -591,20 +675,100 @@ def render_table(headers, rows, right_align_from=1, total_label="Total"):
     return "\n".join(parts)
 
 
+def render_trades_section(trades, transactions, fy_start_year, prefix, title, include_quarter_table=True):
+    parts = [f"<h2>{esc(title)}</h2>"]
+    if not trades:
+        parts.append("<p><em>No transactions.</em></p>")
+        return "\n".join(parts)
+
+    if include_quarter_table:
+        parts.append("<h3>Gains by Quarter</h3>")
+        parts.append(render_table(*build_gains_quarter_rows(trades, fy_start_year, prefix)))
+    parts.append("<h3>Transactions</h3>")
+    parts.append(render_table(*build_transactions_rows(transactions, fy_start_year, prefix)))
+    parts.append("<h3>Transactions - Quarter Breakup</h3>")
+    parts.append(render_table(*build_quarter_breakup_rows(transactions, fy_start_year, prefix)))
+    return "\n".join(parts)
+
+
+def render_debt_fund_bucket(trades, fy_start_year, prefix, title):
+    transactions = group_mf_transactions(trades) if trades else []
+    return render_trades_section(trades, transactions, fy_start_year, prefix, title)
+
+
+def render_dividend_section(dividend_data, fy_start_year, title):
+    parts = [f"<h2>{esc(title)}</h2>"]
+    if not dividend_data:
+        parts.append("<p><em>No transactions.</em></p>")
+        return "\n".join(parts)
+
+    quarters = quarter_bounds(fy_start_year, "DIV")
+    totals = [Decimal(0)] * len(quarters)
+    for d in dividend_data:
+        totals[which_quarter(d["date"], quarters)] += d["amount"]
+    quarter_headers = ["Quarter", "Amount"]
+    quarter_rows = [[label, str(int(t))] for (label, _, _), t in zip(quarters, totals)] + [["Total", str(int(sum(totals)))]]
+
+    txn_headers = ["Symbol", "Ex-Date", "Quarter", "Quantity", "Dividend Per Share", "Net Amount"]
+    txn_rows = []
+    for d in sorted(dividend_data, key=lambda d: d["date"]):
+        quarter_label = quarters[which_quarter(d["date"], quarters)][0]
+        txn_rows.append(
+            [
+                d["symbol"],
+                d["date"].isoformat(),
+                quarter_label,
+                format_inr(d["qty"], decimals=2),
+                format_inr(d["dps"], decimals=2),
+                format_inr(d["amount"], decimals=2),
+            ]
+        )
+    total_qty = sum((d["qty"] for d in dividend_data), Decimal(0))
+    total_amount = sum((d["amount"] for d in dividend_data), Decimal(0))
+    txn_rows.append(["Total", "", "", format_inr(total_qty, decimals=2), "", format_inr(total_amount, decimals=2)])
+
+    parts.append("<h3>Gains by Quarter</h3>")
+    parts.append(render_table(quarter_headers, quarter_rows))
+    parts.append("<h3>Transactions</h3>")
+    parts.append(render_table(txn_headers, txn_rows))
+    return "\n".join(parts)
+
+
+TAX_RATES_REFERENCE = [
+    ["Dividends", "N/A", "Slab rate"],
+    ["Listed Equity Shares", "≤ 12 months", "20% (STCG under Section 111A)"],
+    ["Listed Equity Shares", "> 12 months", "12.5% on LTCG (₹1.25 lakh annual exemption available)"],
+    ["Equity Mutual Funds", "≤ 12 months", "20%"],
+    ["Equity Mutual Funds", "> 12 months", "12.5% (₹1.25 lakh exemption)"],
+    ["Gold ETF", "≤ 12 months", "Slab rate"],
+    ["Gold ETF", "> 12 months", "12.5% (No ₹1.25 lakh exemption, no indexation)"],
+    ["Silver ETF", "≤ 12 months", "Slab rate"],
+    ["Silver ETF", "> 12 months", "12.5%"],
+    ["International Equity Funds", "≤ 24 months", "Slab rate"],
+    ["International Equity Funds", "> 24 months", "12.5%"],
+    ["Debt Mutual Funds (units bought on/after 1 Apr 2023)", "Any period", "Slab rate"],
+    ["Debt Mutual Funds (units bought before 1 Apr 2023)", "> 24 months", "12.5% (subject to grandfathering provisions)"],
+    ["Physical Gold", "≤ 24 months", "Slab rate"],
+    ["Physical Gold", "> 24 months", "12.5%"],
+    ["Real Estate", "≤ 24 months", "Slab rate"],
+    ["Real Estate", "> 24 months", "12.5% (subject to applicable provisions)"],
+]
+
+
 def build_report_html(
-    dividend_table,
-    dividend_txns,
+    client_info,
+    dividend_data,
     summary_table,
-    stcg_txns,
-    stcg_breakup,
-    ltcg_txns,
-    ltcg_breakup,
-    ne_st_table,
-    ne_st_txns,
-    ne_st_breakup,
-    ne_lt_table,
-    ne_lt_txns,
-    ne_lt_breakup,
+    st_data,
+    st_transactions,
+    lt_data,
+    lt_transactions,
+    ne_st_data,
+    ne_st_transactions,
+    ne_lt_data,
+    ne_lt_transactions,
+    fy_start_year,
+    debt_fund_sections,
     dp_charges_table,
     dp_reconciliation_table,
 ):
@@ -617,33 +781,22 @@ def build_report_html(
         "<html><head><meta charset='utf-8'><title>Zerodha Tax Report</title>",
         f"<style>{HTML_STYLE}</style></head><body>",
         "<h1>Zerodha Tax Report</h1>",
+        render_table(
+            ["Field", "Value"],
+            [[label, client_info.get(label, "")] for label in ("Client ID", "Client Name", "PAN")],
+            total_label=None,
+        ),
+        "<h2>Capital Gains Tax Rates (FY 2025-26 / AY 2026-27)</h2>",
+        render_table(["Asset", "Holding Period", "Tax Rate"], TAX_RATES_REFERENCE, right_align_from=99, total_label=None),
         "<h2>Config</h2>",
         render_table(["Setting", "Value"], sections[0][1]),
-        "<h2>Equity Dividends</h2>",
-        render_table(*dividend_table),
-        "<h2>Equity Dividend Transactions</h2>",
-        render_table(*dividend_txns),
-        "<h2>EQ STCG Transactions</h2>",
-        render_table(*stcg_txns),
-        "<h2>EQ STCG Transactions - Quarter Breakup</h2>",
-        render_table(*stcg_breakup),
-        "<h2>EQ LTCG Transactions</h2>",
-        render_table(*ltcg_txns),
-        "<h2>EQ LTCG Transactions - Quarter Breakup</h2>",
-        render_table(*ltcg_breakup),
-        "<h2>Non Equity STCG Gains by Quarter</h2>",
-        render_table(*ne_st_table),
-        "<h2>Non Equity STCG Transactions</h2>",
-        render_table(*ne_st_txns),
-        "<h2>Non Equity STCG Transactions - Quarter Breakup</h2>",
-        render_table(*ne_st_breakup),
-        "<h2>Non Equity LTCG Gains by Quarter</h2>",
-        render_table(*ne_lt_table),
-        "<h2>Non Equity LTCG Transactions</h2>",
-        render_table(*ne_lt_txns),
-        "<h2>Non Equity LTCG Transactions - Quarter Breakup</h2>",
-        render_table(*ne_lt_breakup),
-        "<h2>EQ STCG / LTCG / Non Equity Summary</h2>",
+        render_dividend_section(dividend_data, fy_start_year, "Equity Dividends (Slab rate)"),
+        render_trades_section(st_data, st_transactions, fy_start_year, "EQ-STG", "EQ STCG (20%)", include_quarter_table=False),
+        render_trades_section(lt_data, lt_transactions, fy_start_year, "EQ-LTG", "EQ LTCG (12.5%, ₹1.25 lakh exemption)", include_quarter_table=False),
+        render_trades_section(ne_st_data, ne_st_transactions, fy_start_year, "NE-STCG", "Non Equity STCG (Slab rate)"),
+        render_trades_section(ne_lt_data, ne_lt_transactions, fy_start_year, "NE-LTCG", "Non Equity LTCG (12.5%)"),
+        *debt_fund_sections,
+        "<h2>Overall Summary</h2>",
         render_table(*summary_table, right_align_from=1, total_label=None),
         "<h2>DP Charges (Other Debits and Credits)</h2>",
         render_table(*dp_charges_table),
@@ -673,9 +826,9 @@ def main():
         dp_entries = find_dp_charge_rows(z, strings)
 
     fy_start_year = parse_fy_start_year(dividend_rows) or parse_fy_start_year(trade_rows)
+    client_info = find_client_info(dividend_rows)
 
-    dividend_table = build_dividend_rows(dividend_rows, fy_start_year)
-    dividend_txns = build_dividend_transactions_rows(dividend_rows, fy_start_year)
+    dividend_data = find_dividend_data(dividend_rows)
 
     st_data = extract_trades(find_section(trade_rows, "Equity - Short Term"))
     lt_data = extract_trades(find_section(trade_rows, "Equity - Long Term"))
@@ -694,26 +847,26 @@ def main():
     raw_transactions = {label: group_transactions(trades) for label, trades in sections}
     finalized_transactions = {label: finalize_transactions(raw_transactions[label], dp_alloc[label]) for label, _ in sections}
 
-    stcg_txns = build_transactions_rows(finalized_transactions["EQ-STG"], fy_start_year, "EQ-STG")
-    ltcg_txns = build_transactions_rows(finalized_transactions["EQ-LTG"], fy_start_year, "EQ-LTG")
-    stcg_breakup = build_quarter_breakup_rows(finalized_transactions["EQ-STG"], fy_start_year, "EQ-STG")
-    ltcg_breakup = build_quarter_breakup_rows(finalized_transactions["EQ-LTG"], fy_start_year, "EQ-LTG")
-
-    ne_st_table = build_gains_quarter_rows(ne_st_data, fy_start_year, "NE-STCG")
-    ne_st_txns = build_transactions_rows(finalized_transactions["NE-STCG"], fy_start_year, "NE-STCG")
-    ne_st_breakup = build_quarter_breakup_rows(finalized_transactions["NE-STCG"], fy_start_year, "NE-STCG")
-
-    ne_lt_table = build_gains_quarter_rows(ne_lt_data, fy_start_year, "NE-LTCG")
-    ne_lt_txns = build_transactions_rows(finalized_transactions["NE-LTCG"], fy_start_year, "NE-LTCG")
-    ne_lt_breakup = build_quarter_breakup_rows(finalized_transactions["NE-LTCG"], fy_start_year, "NE-LTCG")
+    mf_data = extract_mf_trades(find_section(trade_rows, "Mutual Funds"))
+    debt_buckets = classify_debt_fund_trades(mf_data)
+    debt_fund_sections = [
+        render_debt_fund_bucket(
+            debt_buckets["new_rule_ltcg"], fy_start_year, "DEBT-NEW-LTCG", "Debt Fund - Bought Before 1-Apr-2023, Sold On/After 23-Jul-2024 (LTCG, 12.5% without indexation, held > 24 months)"
+        ),
+        render_debt_fund_bucket(
+            debt_buckets["post_2023_purchase"], fy_start_year, "DEBT-SLAB", "Debt Fund - Bought On/After 1-Apr-2023 (always slab rate, no LTCG benefit)"
+        ),
+    ]
 
     amc_each = amc_total / 2
     summary_table = build_summary_rows(
         [
-            ("EQ STCG", st_data, finalized_transactions["EQ-STG"], amc_each),
-            ("EQ LTCG", lt_data, finalized_transactions["EQ-LTG"], amc_each),
-            ("Non Equity STCG", ne_st_data, finalized_transactions["NE-STCG"], Decimal(0)),
-            ("Non Equity LTCG", ne_lt_data, finalized_transactions["NE-LTCG"], Decimal(0)),
+            ("EQ STCG (20%)", st_data, finalized_transactions["EQ-STG"], amc_each),
+            ("EQ LTCG (12.5%, ₹1.25 lakh exemption)", lt_data, finalized_transactions["EQ-LTG"], amc_each),
+            ("Non Equity STCG (Slab rate)", ne_st_data, finalized_transactions["NE-STCG"], Decimal(0)),
+            ("Non Equity LTCG (12.5%)", ne_lt_data, finalized_transactions["NE-LTCG"], Decimal(0)),
+            ("Debt Fund - New Rule LTCG (12.5%)", debt_buckets["new_rule_ltcg"], group_mf_transactions(debt_buckets["new_rule_ltcg"]), Decimal(0)),
+            ("Debt Fund - Post 2023 Purchase (Slab rate)", debt_buckets["post_2023_purchase"], group_mf_transactions(debt_buckets["post_2023_purchase"]), Decimal(0)),
         ]
     )
 
@@ -726,19 +879,19 @@ def main():
     )
 
     report_html = build_report_html(
-        dividend_table,
-        dividend_txns,
+        client_info,
+        dividend_data,
         summary_table,
-        stcg_txns,
-        stcg_breakup,
-        ltcg_txns,
-        ltcg_breakup,
-        ne_st_table,
-        ne_st_txns,
-        ne_st_breakup,
-        ne_lt_table,
-        ne_lt_txns,
-        ne_lt_breakup,
+        st_data,
+        finalized_transactions["EQ-STG"],
+        lt_data,
+        finalized_transactions["EQ-LTG"],
+        ne_st_data,
+        finalized_transactions["NE-STCG"],
+        ne_lt_data,
+        finalized_transactions["NE-LTCG"],
+        fy_start_year,
+        debt_fund_sections,
         dp_charges_table,
         dp_reconciliation_table,
     )
