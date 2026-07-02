@@ -30,9 +30,7 @@ DIVIDENDS_SHEET = "equity dividends"
 TRADES_SHEET_PREFIX = "tradewise exits"
 OTHER_DEBITS_SHEET = "other debits and credits"
 
-EQ_STT_PERCENTAGE = Decimal("0.00102")
 DP_CHARGES = Decimal("15.34")
-MF_STT_PERCENTAGE = Decimal("0.00006")
 
 
 def load_shared_strings(z):
@@ -379,10 +377,12 @@ def group_mf_transactions(trades):
 def group_transactions(trades):
     """A unique transaction is all lots bought on the same entry date and sold
     on the same exit date for one symbol (a single buy order matched with a
-    single sell order, even if filled across multiple lot lines). STT applies
-    to its buy and sell value. (DP charges are handled separately - see
-    compute_dp_allocation - since they're billed once per (symbol, exit date)
-    regardless of how many different entry dates/sections that sale spans.)"""
+    single sell order, even if filled across multiple lot lines). STT is not
+    included here: it's excluded from capital gains cost/charges per the
+    proviso to Section 48 (Income Tax Act) for STCG 111A / LTCG 112A trades.
+    (DP charges are handled separately - see compute_dp_allocation - since
+    they're billed once per (symbol, exit date) regardless of how many
+    different entry dates/sections that sale spans.)"""
     by_transaction = defaultdict(lambda: {"buy": Decimal(0), "sell": Decimal(0)})
     for t in trades:
         key = (t["Symbol"], t["Entry"], t["Exit"])
@@ -391,8 +391,7 @@ def group_transactions(trades):
 
     transactions = []
     for (symbol, entry_date, exit_date), totals in sorted(by_transaction.items(), key=lambda kv: kv[0][2]):
-        stt_charge = (totals["buy"] + totals["sell"]) * EQ_STT_PERCENTAGE
-        transactions.append((symbol, entry_date, exit_date, totals["buy"], totals["sell"], stt_charge))
+        transactions.append((symbol, entry_date, exit_date, totals["buy"], totals["sell"], Decimal(0)))
     return transactions
 
 
@@ -773,7 +772,7 @@ def build_report_html(
     dp_reconciliation_table,
 ):
     sections = [
-        ("Config", ([["EQ STT Percentage", str(EQ_STT_PERCENTAGE)], ["DP Charges", str(DP_CHARGES)], ["MF STT Percentage", str(MF_STT_PERCENTAGE)]])),
+        ("Config", ([["DP Charges", str(DP_CHARGES)]])),
     ]
 
     parts = [
