@@ -151,8 +151,14 @@ def find_dividend_data(rows):
         if val is None:
             continue
         label = str(val).strip().lower()
-        if label == "ex-date":
+        if label == "symbol":
+            col_for["symbol"] = col
+        elif label == "ex-date":
             col_for["date"] = col
+        elif label == "quantity":
+            col_for["qty"] = col
+        elif "dividend per share" in label:
+            col_for["dps"] = col
         elif "net dividend" in label:
             col_for["amount"] = col
 
@@ -171,7 +177,15 @@ def find_dividend_data(rows):
             ex_date = datetime.strptime(date_val.strip(), "%Y-%m-%d").date()
         else:
             continue
-        data.append((ex_date, Decimal(amount_val)))
+        data.append(
+            {
+                "symbol": row.get(col_for.get("symbol")),
+                "date": ex_date,
+                "qty": Decimal(row.get(col_for.get("qty")) or 0),
+                "dps": Decimal(row.get(col_for.get("dps")) or 0),
+                "amount": Decimal(amount_val),
+            }
+        )
     return data
 
 
@@ -179,12 +193,37 @@ def build_dividend_rows(rows, fy_start_year):
     data = find_dividend_data(rows)
     quarters = quarter_bounds(fy_start_year, "DIV")
     totals = [Decimal(0)] * len(quarters)
-    for ex_date, amount in data:
-        totals[which_quarter(ex_date, quarters)] += amount
+    for d in data:
+        totals[which_quarter(d["date"], quarters)] += d["amount"]
 
     headers = ["Quarter", "Amount"]
     rows_out = [[label, str(int(t))] for (label, _, _), t in zip(quarters, totals)]
     rows_out.append(["Total", str(int(sum(totals)))])
+    return headers, rows_out
+
+
+def build_dividend_transactions_rows(rows, fy_start_year):
+    data = find_dividend_data(rows)
+    quarters = quarter_bounds(fy_start_year, "DIV")
+
+    headers = ["Symbol", "Ex-Date", "Quarter", "Quantity", "Dividend Per Share", "Net Amount"]
+    rows_out = []
+    for d in sorted(data, key=lambda d: d["date"]):
+        quarter_label = quarters[which_quarter(d["date"], quarters)][0]
+        rows_out.append(
+            [
+                d["symbol"],
+                d["date"].isoformat(),
+                quarter_label,
+                format_inr(d["qty"], decimals=2),
+                format_inr(d["dps"], decimals=2),
+                format_inr(d["amount"], decimals=2),
+            ]
+        )
+
+    total_qty = sum((d["qty"] for d in data), Decimal(0))
+    total_amount = sum((d["amount"] for d in data), Decimal(0))
+    rows_out.append(["Total", "", "", format_inr(total_qty, decimals=2), "", format_inr(total_amount, decimals=2)])
     return headers, rows_out
 
 
@@ -247,11 +286,20 @@ def extract_trades(data_rows):
     return trades
 
 
+def split_by_holding_period(trades, threshold_days=365):
+    """Held for 12 months (365 days) or less: short-term. More than 12 months: long-term."""
+    short_term = [t for t in trades if (t["Exit"] - t["Entry"]).days <= threshold_days]
+    long_term = [t for t in trades if (t["Exit"] - t["Entry"]).days > threshold_days]
+    return short_term, long_term
+
+
 def group_transactions(trades):
     """A unique transaction is all lots bought on the same entry date and sold
     on the same exit date for one symbol (a single buy order matched with a
-    single sell order, even if filled across multiple lot lines). Each unique
-    transaction incurs one DP charge plus STT on its buy and sell value."""
+    single sell order, even if filled across multiple lot lines). STT applies
+    to its buy and sell value. (DP charges are handled separately - see
+    compute_dp_allocation - since they're billed once per (symbol, exit date)
+    regardless of how many different entry dates/sections that sale spans.)"""
     by_transaction = defaultdict(lambda: {"buy": Decimal(0), "sell": Decimal(0)})
     for t in trades:
         key = (t["Symbol"], t["Entry"], t["Exit"])
@@ -260,18 +308,61 @@ def group_transactions(trades):
 
     transactions = []
     for (symbol, entry_date, exit_date), totals in sorted(by_transaction.items(), key=lambda kv: kv[0][2]):
-        charge = DP_CHARGES + totals["buy"] * EQ_STT_PERCENTAGE + totals["sell"] * EQ_STT_PERCENTAGE
-        transactions.append((symbol, entry_date, exit_date, totals["buy"], totals["sell"], charge))
+        stt_charge = (totals["buy"] + totals["sell"]) * EQ_STT_PERCENTAGE
+        transactions.append((symbol, entry_date, exit_date, totals["buy"], totals["sell"], stt_charge))
     return transactions
 
 
-def transaction_charges(trades):
-    return sum((t[5] for t in group_transactions(trades)), Decimal(0))
+def compute_dp_allocation(labeled_trades):
+    """DP charges are billed once per (symbol, exit date) across the whole
+    report, not per section or per entry date. When a sale on a given date
+    spans multiple sections (e.g. some lots ST, some LT), split that one flat
+    fee across the sections proportionally to sell value."""
+    global_sell = defaultdict(Decimal)
+    section_sell = defaultdict(lambda: defaultdict(Decimal))
+    for label, trades in labeled_trades:
+        for t in trades:
+            key = (t["Symbol"], t["Exit"])
+            global_sell[key] += t["Sell"]
+            section_sell[label][key] += t["Sell"]
+
+    dp_alloc = defaultdict(lambda: defaultdict(Decimal))
+    for key, total_sell in global_sell.items():
+        sections_with_key = [label for label, _ in labeled_trades if key in section_sell[label]]
+        if total_sell == 0:
+            share = DP_CHARGES / len(sections_with_key) if sections_with_key else Decimal(0)
+            for label in sections_with_key:
+                dp_alloc[label][key] = share
+            continue
+        for label in sections_with_key:
+            dp_alloc[label][key] = DP_CHARGES * section_sell[label][key] / total_sell
+    return dp_alloc
 
 
-def build_transactions_rows(trades, fy_start_year, prefix):
+def finalize_transactions(transactions, dp_alloc_for_section):
+    """Attach each unique transaction's share of its section's DP charge
+    allocation (split proportionally to sell value among transactions with
+    the same symbol+exit date) on top of its STT charge."""
+    key_sell_totals = defaultdict(Decimal)
+    for symbol, _, exit_date, _, sell, _ in transactions:
+        key_sell_totals[(symbol, exit_date)] += sell
+
+    finalized = []
+    for symbol, entry_date, exit_date, buy, sell, stt_charge in transactions:
+        key = (symbol, exit_date)
+        section_dp_total = dp_alloc_for_section.get(key, Decimal(0))
+        key_total_sell = key_sell_totals[key]
+        dp_share = section_dp_total * sell / key_total_sell if key_total_sell else Decimal(0)
+        finalized.append((symbol, entry_date, exit_date, buy, sell, stt_charge + dp_share))
+    return finalized
+
+
+def transaction_charges(transactions):
+    return sum((t[5] for t in transactions), Decimal(0))
+
+
+def build_transactions_rows(transactions, fy_start_year, prefix):
     quarters = quarter_bounds(fy_start_year, prefix)
-    transactions = group_transactions(trades)
     headers = ["Symbol", "Entry Date", "Exit Date", "Quarter", "Duration (days)", "Buy", "Sell", "Profit/Loss", "Charge"]
     rows_out = []
     for symbol, entry_date, exit_date, buy, sell, charge in transactions:
@@ -311,9 +402,8 @@ def build_transactions_rows(trades, fy_start_year, prefix):
     return headers, rows_out
 
 
-def build_quarter_breakup_rows(trades, fy_start_year, prefix):
+def build_quarter_breakup_rows(transactions, fy_start_year, prefix):
     quarters = quarter_bounds(fy_start_year, prefix)
-    transactions = group_transactions(trades)
 
     buckets = [{"count": 0, "buy": Decimal(0), "sell": Decimal(0), "charge": Decimal(0)} for _ in quarters]
     for _, _, exit_date, buy, sell, charge in transactions:
@@ -371,6 +461,49 @@ def find_amc_total(z, strings):
     return total
 
 
+def find_dp_charge_rows(z, strings):
+    """Actual DP charge line items billed by the broker, one per (symbol, sale
+    date), used to cross-check the DP charge count assumed by group_transactions."""
+    try:
+        sheet_path = find_sheet_path(z, lambda n: n == OTHER_DEBITS_SHEET)
+    except ValueError:
+        return []
+    rows = read_rows(z, sheet_path, strings)
+    entries = []
+    for _, row in rows:
+        b = row.get("B")
+        if isinstance(b, str) and b.startswith("DP Charges for Sale of"):
+            debit = row.get("D")
+            posting_date = row.get("C")
+            if isinstance(debit, Decimal) and isinstance(posting_date, str):
+                entries.append((b, datetime.strptime(posting_date.strip(), "%Y-%m-%d").date(), debit))
+    return sorted(entries, key=lambda e: e[1])
+
+
+def build_dp_charges_rows(dp_entries):
+    headers = ["Particulars", "Posting Date", "Debit"]
+    rows_out = [[particulars, posting_date.isoformat(), format_inr(debit, decimals=2)] for particulars, posting_date, debit in dp_entries]
+    total = sum((debit for _, _, debit in dp_entries), Decimal(0))
+    rows_out.append(["Total", "", format_inr(total, decimals=2)])
+    return headers, rows_out
+
+
+def build_dp_reconciliation_rows(dp_entries, unique_sale_count, section_transaction_counts):
+    sheet_count = len(dp_entries)
+    sheet_total = sum((debit for _, _, debit in dp_entries), Decimal(0))
+    computed_total = DP_CHARGES * unique_sale_count
+
+    headers = ["", "Count", "Amount"]
+    rows_out = [
+        ["Other Debits and Credits sheet", str(sheet_count), format_inr(sheet_total, decimals=2)],
+        ["Computed (unique symbol+exit-date sales x DP Charges)", str(unique_sale_count), format_inr(computed_total, decimals=2)],
+        ["Difference", str(sheet_count - unique_sale_count), format_inr(sheet_total - computed_total, decimals=2)],
+    ]
+    for label, count in section_transaction_counts.items():
+        rows_out.append([f"  {label} transactions (STT lots)", str(count), ""])
+    return headers, rows_out
+
+
 def build_gains_quarter_rows(trades, fy_start_year, prefix):
     quarters = quarter_bounds(fy_start_year, prefix)
     totals = [Decimal(0)] * len(quarters)
@@ -382,30 +515,34 @@ def build_gains_quarter_rows(trades, fy_start_year, prefix):
     return headers, rows_out
 
 
-def section_totals(trades):
+def section_totals(trades, transactions):
     gain = sum((t["Sell"] - t["Buy"] for t in trades), Decimal(0))
     full_value = sum((t["Sell"] for t in trades), Decimal(0))
     cost = sum((t["Buy"] for t in trades), Decimal(0))
-    charges = transaction_charges(trades)
+    charges = transaction_charges(transactions)
     return gain, full_value, cost, charges
 
 
-def build_summary_rows(st_trades, lt_trades, amc_total):
-    amc_each = amc_total / 2
-
-    st_gain, st_full, st_cost, st_charges = section_totals(st_trades)
-    lt_gain, lt_full, lt_cost, lt_charges = section_totals(lt_trades)
-
-    st_total_charges = st_charges + amc_each
-    lt_total_charges = lt_charges + amc_each
-    st_final = st_gain - st_total_charges
-    lt_final = lt_gain - lt_total_charges
-
+def build_summary_rows(labeled_trades):
+    """labeled_trades: list of (label, trades, transactions, amc_share)."""
     headers = ["", "Gain", "Charges", "AMC Charges", "Full value of consideration", "Cost of acquisition", "Total Charges", "Final Gain"]
-    rows_out = [
-        ["EQ STCG", format_inr(st_gain), format_inr(st_charges), format_inr(amc_each), format_inr(st_full, truncate=True), format_inr(st_cost, truncate=True), format_inr(st_total_charges), format_inr(st_final)],
-        ["EQ LTCG", format_inr(lt_gain), format_inr(lt_charges), format_inr(amc_each), format_inr(lt_full, truncate=True), format_inr(lt_cost, truncate=True), format_inr(lt_total_charges), format_inr(lt_final)],
-    ]
+    rows_out = []
+    for label, trades, transactions, amc_share in labeled_trades:
+        gain, full_value, cost, charges = section_totals(trades, transactions)
+        total_charges = charges + amc_share
+        final_gain = gain - total_charges
+        rows_out.append(
+            [
+                label,
+                format_inr(gain),
+                format_inr(charges),
+                format_inr(amc_share),
+                format_inr(full_value, truncate=True),
+                format_inr(cost, truncate=True),
+                format_inr(total_charges),
+                format_inr(final_gain),
+            ]
+        )
     return headers, rows_out
 
 
@@ -454,7 +591,23 @@ def render_table(headers, rows, right_align_from=1, total_label="Total"):
     return "\n".join(parts)
 
 
-def build_report_html(dividend_table, stg_table, ltg_table, summary_table, stcg_txns, stcg_breakup, ltcg_txns, ltcg_breakup, ne_table, ne_txns, ne_breakup):
+def build_report_html(
+    dividend_table,
+    dividend_txns,
+    summary_table,
+    stcg_txns,
+    stcg_breakup,
+    ltcg_txns,
+    ltcg_breakup,
+    ne_st_table,
+    ne_st_txns,
+    ne_st_breakup,
+    ne_lt_table,
+    ne_lt_txns,
+    ne_lt_breakup,
+    dp_charges_table,
+    dp_reconciliation_table,
+):
     sections = [
         ("Config", ([["EQ STT Percentage", str(EQ_STT_PERCENTAGE)], ["DP Charges", str(DP_CHARGES)], ["MF STT Percentage", str(MF_STT_PERCENTAGE)]])),
     ]
@@ -468,10 +621,8 @@ def build_report_html(dividend_table, stg_table, ltg_table, summary_table, stcg_
         render_table(["Setting", "Value"], sections[0][1]),
         "<h2>Equity Dividends</h2>",
         render_table(*dividend_table),
-        "<h2>EQ Short Term Gains by Quarter</h2>",
-        render_table(*stg_table),
-        "<h2>EQ Long Term Gains by Quarter</h2>",
-        render_table(*ltg_table),
+        "<h2>Equity Dividend Transactions</h2>",
+        render_table(*dividend_txns),
         "<h2>EQ STCG Transactions</h2>",
         render_table(*stcg_txns),
         "<h2>EQ STCG Transactions - Quarter Breakup</h2>",
@@ -480,14 +631,24 @@ def build_report_html(dividend_table, stg_table, ltg_table, summary_table, stcg_
         render_table(*ltcg_txns),
         "<h2>EQ LTCG Transactions - Quarter Breakup</h2>",
         render_table(*ltcg_breakup),
-        "<h2>Non Equity Gains by Quarter</h2>",
-        render_table(*ne_table),
-        "<h2>Non Equity Transactions</h2>",
-        render_table(*ne_txns),
-        "<h2>Non Equity Transactions - Quarter Breakup</h2>",
-        render_table(*ne_breakup),
-        "<h2>EQ STCG / LTCG Summary</h2>",
+        "<h2>Non Equity STCG Gains by Quarter</h2>",
+        render_table(*ne_st_table),
+        "<h2>Non Equity STCG Transactions</h2>",
+        render_table(*ne_st_txns),
+        "<h2>Non Equity STCG Transactions - Quarter Breakup</h2>",
+        render_table(*ne_st_breakup),
+        "<h2>Non Equity LTCG Gains by Quarter</h2>",
+        render_table(*ne_lt_table),
+        "<h2>Non Equity LTCG Transactions</h2>",
+        render_table(*ne_lt_txns),
+        "<h2>Non Equity LTCG Transactions - Quarter Breakup</h2>",
+        render_table(*ne_lt_breakup),
+        "<h2>EQ STCG / LTCG / Non Equity Summary</h2>",
         render_table(*summary_table, right_align_from=1, total_label=None),
+        "<h2>DP Charges (Other Debits and Credits)</h2>",
+        render_table(*dp_charges_table),
+        "<h2>DP Charges Reconciliation</h2>",
+        render_table(*dp_reconciliation_table, total_label=None),
         "</body></html>",
     ]
     return "\n".join(parts)
@@ -509,29 +670,77 @@ def main():
         trade_rows = read_rows(z, trades_path, strings)
 
         amc_total = find_amc_total(z, strings)
+        dp_entries = find_dp_charge_rows(z, strings)
 
     fy_start_year = parse_fy_start_year(dividend_rows) or parse_fy_start_year(trade_rows)
 
     dividend_table = build_dividend_rows(dividend_rows, fy_start_year)
+    dividend_txns = build_dividend_transactions_rows(dividend_rows, fy_start_year)
 
     st_data = extract_trades(find_section(trade_rows, "Equity - Short Term"))
     lt_data = extract_trades(find_section(trade_rows, "Equity - Long Term"))
 
-    stg_table = build_gains_quarter_rows(st_data, fy_start_year, "EQ-STG")
-    ltg_table = build_gains_quarter_rows(lt_data, fy_start_year, "EQ-LTG")
-    summary_table = build_summary_rows(st_data, lt_data, amc_total)
-    stcg_txns = build_transactions_rows(st_data, fy_start_year, "EQ-STG")
-    ltcg_txns = build_transactions_rows(lt_data, fy_start_year, "EQ-LTG")
-    stcg_breakup = build_quarter_breakup_rows(st_data, fy_start_year, "EQ-STG")
-    ltcg_breakup = build_quarter_breakup_rows(lt_data, fy_start_year, "EQ-LTG")
-
     ne_data = extract_trades(find_section(trade_rows, "Non Equity"))
-    ne_table = build_gains_quarter_rows(ne_data, fy_start_year, "NE")
-    ne_txns = build_transactions_rows(ne_data, fy_start_year, "NE")
-    ne_breakup = build_quarter_breakup_rows(ne_data, fy_start_year, "NE")
+    ne_st_data, ne_lt_data = split_by_holding_period(ne_data)
+
+    sections = [
+        ("EQ-STG", st_data),
+        ("EQ-LTG", lt_data),
+        ("NE-STCG", ne_st_data),
+        ("NE-LTCG", ne_lt_data),
+    ]
+    dp_alloc = compute_dp_allocation(sections)
+
+    raw_transactions = {label: group_transactions(trades) for label, trades in sections}
+    finalized_transactions = {label: finalize_transactions(raw_transactions[label], dp_alloc[label]) for label, _ in sections}
+
+    stcg_txns = build_transactions_rows(finalized_transactions["EQ-STG"], fy_start_year, "EQ-STG")
+    ltcg_txns = build_transactions_rows(finalized_transactions["EQ-LTG"], fy_start_year, "EQ-LTG")
+    stcg_breakup = build_quarter_breakup_rows(finalized_transactions["EQ-STG"], fy_start_year, "EQ-STG")
+    ltcg_breakup = build_quarter_breakup_rows(finalized_transactions["EQ-LTG"], fy_start_year, "EQ-LTG")
+
+    ne_st_table = build_gains_quarter_rows(ne_st_data, fy_start_year, "NE-STCG")
+    ne_st_txns = build_transactions_rows(finalized_transactions["NE-STCG"], fy_start_year, "NE-STCG")
+    ne_st_breakup = build_quarter_breakup_rows(finalized_transactions["NE-STCG"], fy_start_year, "NE-STCG")
+
+    ne_lt_table = build_gains_quarter_rows(ne_lt_data, fy_start_year, "NE-LTCG")
+    ne_lt_txns = build_transactions_rows(finalized_transactions["NE-LTCG"], fy_start_year, "NE-LTCG")
+    ne_lt_breakup = build_quarter_breakup_rows(finalized_transactions["NE-LTCG"], fy_start_year, "NE-LTCG")
+
+    amc_each = amc_total / 2
+    summary_table = build_summary_rows(
+        [
+            ("EQ STCG", st_data, finalized_transactions["EQ-STG"], amc_each),
+            ("EQ LTCG", lt_data, finalized_transactions["EQ-LTG"], amc_each),
+            ("Non Equity STCG", ne_st_data, finalized_transactions["NE-STCG"], Decimal(0)),
+            ("Non Equity LTCG", ne_lt_data, finalized_transactions["NE-LTCG"], Decimal(0)),
+        ]
+    )
+
+    unique_sale_count = len({(t["Symbol"], t["Exit"]) for _, trades in sections for t in trades})
+    dp_charges_table = build_dp_charges_rows(dp_entries)
+    dp_reconciliation_table = build_dp_reconciliation_rows(
+        dp_entries,
+        unique_sale_count,
+        {label: len(raw_transactions[label]) for label, _ in sections},
+    )
 
     report_html = build_report_html(
-        dividend_table, stg_table, ltg_table, summary_table, stcg_txns, stcg_breakup, ltcg_txns, ltcg_breakup, ne_table, ne_txns, ne_breakup
+        dividend_table,
+        dividend_txns,
+        summary_table,
+        stcg_txns,
+        stcg_breakup,
+        ltcg_txns,
+        ltcg_breakup,
+        ne_st_table,
+        ne_st_txns,
+        ne_st_breakup,
+        ne_lt_table,
+        ne_lt_txns,
+        ne_lt_breakup,
+        dp_charges_table,
+        dp_reconciliation_table,
     )
 
     output_path = Path(path).with_name(Path(path).stem + "-report.html")
