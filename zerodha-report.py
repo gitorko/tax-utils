@@ -582,7 +582,7 @@ def build_dp_reconciliation_rows(dp_entries, unique_sale_count, section_transact
         ["Difference", str(sheet_count - unique_sale_count), format_inr(sheet_total - computed_total, decimals=2)],
     ]
     for label, count in section_transaction_counts.items():
-        rows_out.append([f"  {label} transactions (STT lots)", str(count), ""])
+        rows_out.append([f"  {label} transactions (entry+exit lots)", str(count), ""])
     return headers, rows_out
 
 
