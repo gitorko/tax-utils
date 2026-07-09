@@ -18,7 +18,7 @@ import html
 import webbrowser
 from pathlib import Path
 from datetime import date, datetime
-from decimal import Decimal, ROUND_HALF_DOWN
+from decimal import Decimal, ROUND_HALF_UP
 from collections import defaultdict
 import xml.etree.ElementTree as ET
 
@@ -109,12 +109,15 @@ def which_quarter(d, quarters):
     return None
 
 
-def format_inr(value, truncate=False, decimals=0):
+def round_inr(value, truncate=False):
+    rounding = "ROUND_DOWN" if truncate else ROUND_HALF_UP
+    return value.quantize(Decimal(1), rounding=rounding)
+
+
+def format_inr(value, truncate=False):
+    value = round_inr(value, truncate=truncate)
     negative = value < 0
-    quantum = Decimal(1).scaleb(-decimals)
-    rounding = "ROUND_DOWN" if truncate else ROUND_HALF_DOWN
-    scaled = value.copy_abs().quantize(quantum, rounding=rounding)
-    whole, _, frac = str(scaled).partition(".")
+    whole = str(value.copy_abs())
     if len(whole) > 3:
         last3, rest = whole[-3:], whole[:-3]
         groups = []
@@ -124,8 +127,7 @@ def format_inr(value, truncate=False, decimals=0):
         if rest:
             groups.insert(0, rest)
         whole = ",".join(groups) + "," + last3
-    suffix = f".{frac}" if decimals else ".00"
-    return ("-" if negative else "") + whole + suffix
+    return ("-" if negative else "") + whole
 
 
 def find_client_info(rows):
@@ -223,15 +225,15 @@ def build_dividend_transactions_rows(rows, fy_start_year):
                 d["symbol"],
                 d["date"].isoformat(),
                 quarter_label,
-                format_inr(d["qty"], decimals=2),
-                format_inr(d["dps"], decimals=2),
-                format_inr(d["amount"], decimals=2),
+                format_inr(d["qty"]),
+                format_inr(d["dps"]),
+                format_inr(d["amount"]),
             ]
         )
 
     total_qty = sum((d["qty"] for d in data), Decimal(0))
     total_amount = sum((d["amount"] for d in data), Decimal(0))
-    rows_out.append(["Total", "", "", format_inr(total_qty, decimals=2), "", format_inr(total_amount, decimals=2)])
+    rows_out.append(["Total", "", "", format_inr(total_qty), "", format_inr(total_amount)])
     return headers, rows_out
 
 
@@ -375,23 +377,23 @@ def group_mf_transactions(trades):
 
 
 def group_transactions(trades):
-    """A unique transaction is all lots bought on the same entry date and sold
-    on the same exit date for one symbol (a single buy order matched with a
-    single sell order, even if filled across multiple lot lines). STT is not
-    included here: it's excluded from capital gains cost/charges per the
-    proviso to Section 48 (Income Tax Act) for STCG 111A / LTCG 112A trades.
-    (DP charges are handled separately - see compute_dp_allocation - since
-    they're billed once per (symbol, exit date) regardless of how many
+    """A unique transaction is all lots of one symbol sold on the same exit
+    date - lots bought on different entry dates are merged into a single row,
+    since holding-period (short/long term) is already implied by the section.
+    STT is not included here: it's excluded from capital gains cost/charges
+    per the proviso to Section 48 (Income Tax Act) for STCG 111A / LTCG 112A
+    trades. (DP charges are handled separately - see compute_dp_allocation -
+    since they're billed once per (symbol, exit date) regardless of how many
     different entry dates/sections that sale spans.)"""
     by_transaction = defaultdict(lambda: {"buy": Decimal(0), "sell": Decimal(0)})
     for t in trades:
-        key = (t["Symbol"], t["Entry"], t["Exit"])
+        key = (t["Symbol"], t["Exit"])
         by_transaction[key]["buy"] += t["Buy"]
         by_transaction[key]["sell"] += t["Sell"]
 
     transactions = []
-    for (symbol, entry_date, exit_date), totals in sorted(by_transaction.items(), key=lambda kv: kv[0][2]):
-        transactions.append((symbol, entry_date, exit_date, totals["buy"], totals["sell"], Decimal(0)))
+    for (symbol, exit_date), totals in sorted(by_transaction.items(), key=lambda kv: kv[0][1]):
+        transactions.append((symbol, None, exit_date, totals["buy"], totals["sell"], Decimal(0)))
     return transactions
 
 
@@ -443,44 +445,71 @@ def transaction_charges(transactions):
     return sum((t[5] for t in transactions), Decimal(0))
 
 
-def build_transactions_rows(transactions, fy_start_year, prefix):
+def build_transactions_rows(transactions, fy_start_year, prefix, include_entry_date=True):
     quarters = quarter_bounds(fy_start_year, prefix)
-    headers = ["Symbol", "Entry Date", "Exit Date", "Quarter", "Duration (days)", "Buy", "Sell", "Profit/Loss", "Charge"]
+    if include_entry_date:
+        headers = ["Symbol", "Entry Date", "Exit Date", "Quarter", "Duration (days)", "Buy", "Sell", "Profit/Loss", "Charge"]
+    else:
+        headers = ["Symbol", "Exit Date", "Quarter", "Buy", "Sell", "Profit/Loss", "Charge"]
     rows_out = []
+    total_buy = total_sell = total_profit_loss = total_charge = Decimal(0)
     for symbol, entry_date, exit_date, buy, sell, charge in transactions:
         quarter_label = quarters[which_quarter(exit_date, quarters)][0]
-        duration = (exit_date - entry_date).days
-        profit_loss = sell - buy
-        rows_out.append(
-            [
-                symbol,
-                entry_date.isoformat(),
-                exit_date.isoformat(),
-                quarter_label,
-                str(duration),
-                format_inr(buy, decimals=2),
-                format_inr(sell, decimals=2),
-                format_inr(profit_loss, decimals=2),
-                format_inr(charge, decimals=2),
-            ]
-        )
-    total_buy = sum((t[3] for t in transactions), Decimal(0))
-    total_sell = sum((t[4] for t in transactions), Decimal(0))
-    total_charge = sum((t[5] for t in transactions), Decimal(0))
-    total_profit_loss = total_sell - total_buy
-    rows_out.append(
-        [
+        r_buy, r_sell, r_profit_loss, r_charge = round_inr(buy), round_inr(sell), round_inr(sell - buy), round_inr(charge)
+        total_buy += r_buy
+        total_sell += r_sell
+        total_profit_loss += r_profit_loss
+        total_charge += r_charge
+        if include_entry_date:
+            duration = (exit_date - entry_date).days
+            rows_out.append(
+                [
+                    symbol,
+                    entry_date.isoformat(),
+                    exit_date.isoformat(),
+                    quarter_label,
+                    str(duration),
+                    format_inr(r_buy),
+                    format_inr(r_sell),
+                    format_inr(r_profit_loss),
+                    format_inr(r_charge),
+                ]
+            )
+        else:
+            rows_out.append(
+                [
+                    symbol,
+                    exit_date.isoformat(),
+                    quarter_label,
+                    format_inr(r_buy),
+                    format_inr(r_sell),
+                    format_inr(r_profit_loss),
+                    format_inr(r_charge),
+                ]
+            )
+    if include_entry_date:
+        total_row = [
             "Total",
             "",
             "",
             "",
             "",
-            format_inr(total_buy, decimals=2),
-            format_inr(total_sell, decimals=2),
-            format_inr(total_profit_loss, decimals=2),
-            format_inr(total_charge, decimals=2),
+            format_inr(total_buy),
+            format_inr(total_sell),
+            format_inr(total_profit_loss),
+            format_inr(total_charge),
         ]
-    )
+    else:
+        total_row = [
+            "Total",
+            "",
+            "",
+            format_inr(total_buy),
+            format_inr(total_sell),
+            format_inr(total_profit_loss),
+            format_inr(total_charge),
+        ]
+    rows_out.append(total_row)
     return headers, rows_out
 
 
@@ -495,52 +524,44 @@ def build_quarter_breakup_rows(transactions, fy_start_year, prefix):
         bucket["sell"] += sell
         bucket["charge"] += charge
 
-    headers = ["Quarter", "Transactions", "Buy", "Sell", "Profit/Loss", "Charge"]
+    headers = ["Quarter", "Transactions", "Buy", "Sell", "Profit/Loss", "Charge", "Final Gain"]
     rows_out = []
+    total_count = 0
+    total_buy = total_sell = total_profit_loss = total_charge = total_final_gain = Decimal(0)
     for (label, _, _), bucket in zip(quarters, buckets):
-        profit_loss = bucket["sell"] - bucket["buy"]
+        r_buy, r_sell, r_charge = round_inr(bucket["buy"]), round_inr(bucket["sell"]), round_inr(bucket["charge"])
+        r_profit_loss = round_inr(bucket["sell"] - bucket["buy"])
+        r_final_gain = r_profit_loss - r_charge
+        total_count += bucket["count"]
+        total_buy += r_buy
+        total_sell += r_sell
+        total_profit_loss += r_profit_loss
+        total_charge += r_charge
+        total_final_gain += r_final_gain
         rows_out.append(
             [
                 label,
                 str(bucket["count"]),
-                format_inr(bucket["buy"], decimals=2),
-                format_inr(bucket["sell"], decimals=2),
-                format_inr(profit_loss, decimals=2),
-                format_inr(bucket["charge"], decimals=2),
+                format_inr(r_buy),
+                format_inr(r_sell),
+                format_inr(r_profit_loss),
+                format_inr(r_charge),
+                format_inr(r_final_gain),
             ]
         )
 
-    total_count = sum(b["count"] for b in buckets)
-    total_buy = sum((b["buy"] for b in buckets), Decimal(0))
-    total_sell = sum((b["sell"] for b in buckets), Decimal(0))
-    total_charge = sum((b["charge"] for b in buckets), Decimal(0))
     rows_out.append(
         [
             "Total",
             str(total_count),
-            format_inr(total_buy, decimals=2),
-            format_inr(total_sell, decimals=2),
-            format_inr(total_sell - total_buy, decimals=2),
-            format_inr(total_charge, decimals=2),
+            format_inr(total_buy),
+            format_inr(total_sell),
+            format_inr(total_profit_loss),
+            format_inr(total_charge),
+            format_inr(total_final_gain),
         ]
     )
     return headers, rows_out
-
-
-def find_amc_total(z, strings):
-    try:
-        sheet_path = find_sheet_path(z, lambda n: n == OTHER_DEBITS_SHEET)
-    except ValueError:
-        return Decimal(0)
-    rows = read_rows(z, sheet_path, strings)
-    total = Decimal(0)
-    for _, row in rows:
-        b = row.get("B")
-        if isinstance(b, str) and b.startswith("AMC for Demat"):
-            debit = row.get("D")
-            if isinstance(debit, Decimal):
-                total += debit
-    return total
 
 
 def find_dp_charge_rows(z, strings):
@@ -564,9 +585,9 @@ def find_dp_charge_rows(z, strings):
 
 def build_dp_charges_rows(dp_entries):
     headers = ["Particulars", "Posting Date", "Debit"]
-    rows_out = [[particulars, posting_date.isoformat(), format_inr(debit, decimals=2)] for particulars, posting_date, debit in dp_entries]
-    total = sum((debit for _, _, debit in dp_entries), Decimal(0))
-    rows_out.append(["Total", "", format_inr(total, decimals=2)])
+    rounded_debits = [round_inr(debit) for _, _, debit in dp_entries]
+    rows_out = [[particulars, posting_date.isoformat(), format_inr(r_debit)] for (particulars, posting_date, _), r_debit in zip(dp_entries, rounded_debits)]
+    rows_out.append(["Total", "", format_inr(sum(rounded_debits, Decimal(0)))])
     return headers, rows_out
 
 
@@ -577,9 +598,9 @@ def build_dp_reconciliation_rows(dp_entries, unique_sale_count, section_transact
 
     headers = ["", "Count", "Amount"]
     rows_out = [
-        ["Other Debits and Credits sheet", str(sheet_count), format_inr(sheet_total, decimals=2)],
-        ["Computed (unique symbol+exit-date sales x DP Charges)", str(unique_sale_count), format_inr(computed_total, decimals=2)],
-        ["Difference", str(sheet_count - unique_sale_count), format_inr(sheet_total - computed_total, decimals=2)],
+        ["Other Debits and Credits sheet", str(sheet_count), format_inr(sheet_total)],
+        ["Computed (unique symbol+exit-date sales x DP Charges)", str(unique_sale_count), format_inr(computed_total)],
+        ["Difference", str(sheet_count - unique_sale_count), format_inr(sheet_total - computed_total)],
     ]
     for label, count in section_transaction_counts.items():
         rows_out.append([f"  {label} transactions (entry+exit lots)", str(count), ""])
@@ -606,22 +627,19 @@ def section_totals(trades, transactions):
 
 
 def build_summary_rows(labeled_trades):
-    """labeled_trades: list of (label, trades, transactions, amc_share)."""
-    headers = ["", "Gain", "Charges", "AMC Charges", "Full value of consideration", "Cost of acquisition", "Total Charges", "Final Gain"]
+    """labeled_trades: list of (label, trades, transactions)."""
+    headers = ["", "Gain", "Charges", "Full value of consideration", "Cost of acquisition", "Final Gain"]
     rows_out = []
-    for label, trades, transactions, amc_share in labeled_trades:
+    for label, trades, transactions in labeled_trades:
         gain, full_value, cost, charges = section_totals(trades, transactions)
-        total_charges = charges + amc_share
-        final_gain = gain - total_charges
+        final_gain = gain - charges
         rows_out.append(
             [
                 label,
                 format_inr(gain),
                 format_inr(charges),
-                format_inr(amc_share),
                 format_inr(full_value, truncate=True),
                 format_inr(cost, truncate=True),
-                format_inr(total_charges),
                 format_inr(final_gain),
             ]
         )
@@ -674,7 +692,7 @@ def render_table(headers, rows, right_align_from=1, total_label="Total"):
     return "\n".join(parts)
 
 
-def render_trades_section(trades, transactions, fy_start_year, prefix, title, include_quarter_table=True):
+def render_trades_section(trades, transactions, fy_start_year, prefix, title, include_quarter_table=True, include_entry_date=True):
     parts = [f"<h2>{esc(title)}</h2>"]
     if not trades:
         parts.append("<p><em>No transactions.</em></p>")
@@ -684,15 +702,10 @@ def render_trades_section(trades, transactions, fy_start_year, prefix, title, in
         parts.append("<h3>Gains by Quarter</h3>")
         parts.append(render_table(*build_gains_quarter_rows(trades, fy_start_year, prefix)))
     parts.append("<h3>Transactions</h3>")
-    parts.append(render_table(*build_transactions_rows(transactions, fy_start_year, prefix)))
+    parts.append(render_table(*build_transactions_rows(transactions, fy_start_year, prefix, include_entry_date=include_entry_date)))
     parts.append("<h3>Transactions - Quarter Breakup</h3>")
     parts.append(render_table(*build_quarter_breakup_rows(transactions, fy_start_year, prefix)))
     return "\n".join(parts)
-
-
-def render_debt_fund_bucket(trades, fy_start_year, prefix, title):
-    transactions = group_mf_transactions(trades) if trades else []
-    return render_trades_section(trades, transactions, fy_start_year, prefix, title)
 
 
 def render_dividend_section(dividend_data, fy_start_year, title):
@@ -717,14 +730,14 @@ def render_dividend_section(dividend_data, fy_start_year, title):
                 d["symbol"],
                 d["date"].isoformat(),
                 quarter_label,
-                format_inr(d["qty"], decimals=2),
-                format_inr(d["dps"], decimals=2),
-                format_inr(d["amount"], decimals=2),
+                format_inr(d["qty"]),
+                format_inr(d["dps"]),
+                format_inr(d["amount"]),
             ]
         )
     total_qty = sum((d["qty"] for d in dividend_data), Decimal(0))
     total_amount = sum((d["amount"] for d in dividend_data), Decimal(0))
-    txn_rows.append(["Total", "", "", format_inr(total_qty, decimals=2), "", format_inr(total_amount, decimals=2)])
+    txn_rows.append(["Total", "", "", format_inr(total_qty), "", format_inr(total_amount)])
 
     parts.append("<h3>Gains by Quarter</h3>")
     parts.append(render_table(quarter_headers, quarter_rows))
@@ -764,8 +777,6 @@ def build_report_html(
     lt_transactions,
     ne_st_data,
     ne_st_transactions,
-    ne_lt_data,
-    ne_lt_transactions,
     fy_start_year,
     debt_fund_sections,
     dp_charges_table,
@@ -791,10 +802,9 @@ def build_report_html(
         "<h2>Config</h2>",
         render_table(["Setting", "Value"], sections[0][1]),
         render_dividend_section(dividend_data, fy_start_year, "Equity Dividends (Slab rate)"),
-        render_trades_section(st_data, st_transactions, fy_start_year, "EQ-STG", "EQ STCG (20%)", include_quarter_table=False),
-        render_trades_section(lt_data, lt_transactions, fy_start_year, "EQ-LTG", "EQ LTCG (12.5%, ₹1.25 lakh exemption)", include_quarter_table=False),
-        render_trades_section(ne_st_data, ne_st_transactions, fy_start_year, "NE-STCG", "Non Equity STCG (Slab rate)"),
-        render_trades_section(ne_lt_data, ne_lt_transactions, fy_start_year, "NE-LTCG", "Non Equity LTCG (12.5%)"),
+        render_trades_section(st_data, st_transactions, fy_start_year, "EQ-STG", "EQ STCG (20%)", include_quarter_table=False, include_entry_date=False),
+        render_trades_section(lt_data, lt_transactions, fy_start_year, "EQ-LTG", "EQ LTCG (12.5%, ₹1.25 lakh exemption)", include_quarter_table=False, include_entry_date=False),
+        render_trades_section(ne_st_data, ne_st_transactions, fy_start_year, "DEBT-ST", "Debt Short Term", include_entry_date=False),
         *debt_fund_sections,
         "<h2>Overall Summary</h2>",
         render_table(*summary_table, right_align_from=1, total_label=None),
@@ -822,7 +832,6 @@ def main():
         trades_path = find_sheet_path(z, lambda n: n.startswith(TRADES_SHEET_PREFIX))
         trade_rows = read_rows(z, trades_path, strings)
 
-        amc_total = find_amc_total(z, strings)
         dp_entries = find_dp_charge_rows(z, strings)
 
     fy_start_year = parse_fy_start_year(dividend_rows) or parse_fy_start_year(trade_rows)
@@ -849,24 +858,46 @@ def main():
 
     mf_data = extract_mf_trades(find_section(trade_rows, "Mutual Funds"))
     debt_buckets = classify_debt_fund_trades(mf_data)
+
+    # Gold ETF long-term trades (Non-Equity section, >12 months, 12.5% no
+    # indexation) land in the same ITR2 Schedule CG row as debt funds bought
+    # before 1-Apr-2023 and sold on/after 23-Jul-2024 (>24 months, same rate),
+    # so they're clubbed into one combined section/summary row. Entry date is
+    # kept (unlike the other sections) so Duration can disambiguate the two:
+    # anything under ~24 months must be Gold ETF, since debt fund LTCG here
+    # requires >24 months.
+    ne_lt_transactions_with_entry_date = finalize_transactions(group_mf_transactions(ne_lt_data), dp_alloc["NE-LTCG"])
+    combined_new_rule_ltcg_trades = ne_lt_data + debt_buckets["new_rule_ltcg"]
+    combined_new_rule_ltcg_transactions = sorted(
+        ne_lt_transactions_with_entry_date + group_mf_transactions(debt_buckets["new_rule_ltcg"]),
+        key=lambda t: t[2],
+    )
+
+    # Debt funds bought on/after 1-Apr-2023 are always slab rate regardless of
+    # holding period (Section 50AA) - same treatment as Debt Short Term - so
+    # they're clubbed into that section/summary row instead of standing alone.
+    combined_debt_st_trades = ne_st_data + debt_buckets["post_2023_purchase"]
+    combined_debt_st_transactions = sorted(
+        finalized_transactions["NE-STCG"] + group_mf_transactions(debt_buckets["post_2023_purchase"]),
+        key=lambda t: t[2],
+    )
+
     debt_fund_sections = [
-        render_debt_fund_bucket(
-            debt_buckets["new_rule_ltcg"], fy_start_year, "DEBT-NEW-LTCG", "Debt Fund - Bought Before 1-Apr-2023, Sold On/After 23-Jul-2024 (LTCG, 12.5% without indexation, held > 24 months)"
-        ),
-        render_debt_fund_bucket(
-            debt_buckets["post_2023_purchase"], fy_start_year, "DEBT-SLAB", "Debt Fund - Bought On/After 1-Apr-2023 (always slab rate, no LTCG benefit)"
+        render_trades_section(
+            combined_new_rule_ltcg_trades,
+            combined_new_rule_ltcg_transactions,
+            fy_start_year,
+            "DEBT-NEW-LTCG",
+            "LTCG 12.5% (no indexation) - Gold ETF (held > 12 months) & Debt Fund bought before 1-Apr-2023, sold on/after 23-Jul-2024 (held > 24 months)",
         ),
     ]
 
-    amc_each = amc_total / 2
     summary_table = build_summary_rows(
         [
-            ("EQ STCG (20%)", st_data, finalized_transactions["EQ-STG"], amc_each),
-            ("EQ LTCG (12.5%, ₹1.25 lakh exemption)", lt_data, finalized_transactions["EQ-LTG"], amc_each),
-            ("Non Equity STCG (Slab rate)", ne_st_data, finalized_transactions["NE-STCG"], Decimal(0)),
-            ("Non Equity LTCG (12.5%)", ne_lt_data, finalized_transactions["NE-LTCG"], Decimal(0)),
-            ("Debt Fund - New Rule LTCG (12.5%)", debt_buckets["new_rule_ltcg"], group_mf_transactions(debt_buckets["new_rule_ltcg"]), Decimal(0)),
-            ("Debt Fund - Post 2023 Purchase (Slab rate)", debt_buckets["post_2023_purchase"], group_mf_transactions(debt_buckets["post_2023_purchase"]), Decimal(0)),
+            ("EQ STCG (20%)", st_data, finalized_transactions["EQ-STG"]),
+            ("EQ LTCG (12.5%, ₹1.25 lakh exemption)", lt_data, finalized_transactions["EQ-LTG"]),
+            ("Debt Short Term", combined_debt_st_trades, combined_debt_st_transactions),
+            ("Gold ETF & Debt Fund LTCG (12.5%)", combined_new_rule_ltcg_trades, combined_new_rule_ltcg_transactions),
         ]
     )
 
@@ -886,10 +917,8 @@ def main():
         finalized_transactions["EQ-STG"],
         lt_data,
         finalized_transactions["EQ-LTG"],
-        ne_st_data,
-        finalized_transactions["NE-STCG"],
-        ne_lt_data,
-        finalized_transactions["NE-LTCG"],
+        combined_debt_st_trades,
+        combined_debt_st_transactions,
         fy_start_year,
         debt_fund_sections,
         dp_charges_table,
