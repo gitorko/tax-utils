@@ -207,8 +207,8 @@ def build_dividend_rows(rows, fy_start_year):
         totals[which_quarter(d["date"], quarters)] += d["amount"]
 
     headers = ["Quarter", "Amount"]
-    rows_out = [[label, str(int(t))] for (label, _, _), t in zip(quarters, totals)]
-    rows_out.append(["Total", str(int(sum(totals)))])
+    rows_out = [[label, format_inr(t)] for (label, _, _), t in zip(quarters, totals)]
+    rows_out.append(["Total", format_inr(sum(totals))])
     return headers, rows_out
 
 
@@ -719,7 +719,7 @@ def render_dividend_section(dividend_data, fy_start_year, title):
     for d in dividend_data:
         totals[which_quarter(d["date"], quarters)] += d["amount"]
     quarter_headers = ["Quarter", "Amount"]
-    quarter_rows = [[label, str(int(t))] for (label, _, _), t in zip(quarters, totals)] + [["Total", str(int(sum(totals)))]]
+    quarter_rows = [[label, format_inr(t)] for (label, _, _), t in zip(quarters, totals)] + [["Total", format_inr(sum(totals))]]
 
     txn_headers = ["Symbol", "Ex-Date", "Quarter", "Quantity", "Dividend Per Share", "Net Amount"]
     txn_rows = []
